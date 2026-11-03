@@ -1,0 +1,27 @@
+[Unit]
+Description=Posttrain training statistics dashboard
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/dirigent/posttrain-dashboard
+EnvironmentFile=/home/dirigent/posttrain-dashboard/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/dirigent/posttrain-dashboard/.venv/bin/python /home/dirigent/posttrain-dashboard/app.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+Nice=10
+CPUQuota=50%
+MemoryMax=512M
+TasksMax=128
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/dirigent/posttrain-dashboard/runtime
+
+[Install]
+WantedBy=default.target
+

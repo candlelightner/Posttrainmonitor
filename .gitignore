@@ -1,0 +1,13 @@
+.venv/
+.browsers/
+.browser-libs/
+.nicegui/
+.env
+.env.*
+runtime/
+bin/
+artifacts/
+__pycache__/
+.pytest_cache/
+*.pyc
+

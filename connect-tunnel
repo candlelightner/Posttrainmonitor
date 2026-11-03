@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""Save a remotely managed tunnel token privately, then start its user service."""
+import getpass
+import os
+from pathlib import Path
+import subprocess
+
+project = Path(__file__).resolve().parent
+runtime = project / 'runtime'
+runtime.mkdir(mode=0o700, exist_ok=True)
+runtime.chmod(0o700)
+token = getpass.getpass('Cloudflare tunnel connector token: ').strip()
+if len(token) < 32 or any(character.isspace() for character in token):
+    raise SystemExit('The connector token must be one nonempty value.')
+path = runtime / 'tunnel.token'
+flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
+descriptor = os.open(path, flags, 0o600)
+with os.fdopen(descriptor, 'w') as stream:
+    stream.write(token + '\n')
+path.chmod(0o600)
+del token
+subprocess.run(['systemctl', '--user', 'enable', '--now', 'posttrain-tunnel.service'], check=True)
+print('Tunnel service started. Public hostname: https://posttrain.dirigent.uk')
+
