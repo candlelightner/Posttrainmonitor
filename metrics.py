@@ -1,6 +1,7 @@
 """Read-only, allowlisted training aggregates; no training or model dependencies."""
 from copy import deepcopy
 from datetime import datetime
+import hashlib
 import json
 import math
 import os
@@ -13,6 +14,9 @@ import time
 
 REFRESH_SECONDS = 30
 STATES = {"running", "completed", "failed", "failed_artifact_audit"}
+STATE_LABELS = {"running": "Running", "completed": "Completed", "failed": "Run stopped",
+                "failed_artifact_audit": "Review needed", "stopped_for_review": "Stopped for review",
+                "unavailable": "Waiting for run"}
 PHASES = {"loading", "training", "validation", "finalizing"}
 EVENT_PHASES = {"final_run_preflight", "validation_start", "validation_progress",
                 "validation_complete", "training", "checkpoint_complete", "training_complete"}
@@ -22,7 +26,8 @@ RESOURCE_FIELDS = ("gpu_used_mib", "gpu_total_mib", "gpu_utilization_percent",
                    "ram_available_gib", "ram_total_gib", "disk_free_gib", "disk_total_gib",
                    "cpu_percent", "process_rss_gib")
 AGGREGATES = {"configs/final-run.json", "data/manifest.json", "runs/final-preparation.json",
-              "runs/monitor/latest.json", "runs/full/checkpoints.json"}
+              "runs/monitor/latest.json", "runs/full/checkpoints.json",
+              "runs/intentional-stop-review.json"}
 
 
 def numeric(value, *, integer=False):
@@ -79,6 +84,7 @@ class MetricsStore:
         self._errors = 0
         self._history_partial = False
         self._resource_persisted = False
+        self._config_sha256 = None
         self._load_resource_history()
 
     def _path(self, relative):
@@ -94,16 +100,83 @@ class MetricsStore:
     def _aggregate(self, relative):
         if relative not in AGGREGATES:
             raise ValueError("aggregate_not_allowlisted")
+        if relative == "configs/final-run.json":
+            self._config_sha256 = None
         try:
             path = self._path(relative)
             if not path.exists():
                 return {}
             if path.stat().st_size > 8 * 1024 * 1024:
                 raise ValueError("aggregate_too_large")
-            return object_value(json.loads(path.read_text(encoding="utf-8")))
+            encoded = path.read_bytes()
+            result = object_value(json.loads(encoded.decode("utf-8")))
+            if relative == "configs/final-run.json":
+                self._config_sha256 = hashlib.sha256(encoded).hexdigest()
+            return result
         except (OSError, ValueError, UnicodeError):
             self._errors += 1
             return {}
+
+    def _review_checkpoint(self, monitor, inventory, total, interval, latest):
+        """Derive a partial-review state from fixed aggregate identity bindings.
+
+        This never loads the checkpoint verifier or any model/payload. Process
+        identifiers and the config digest are compared internally and never
+        included in the public snapshot. A running/new run cannot inherit the
+        old marker merely because the marker file remains present.
+        """
+        if monitor.get("state") != "failed":
+            return None
+        marker = self._aggregate("runs/intentional-stop-review.json")
+        if (type(marker.get("schema_version")) is not int or marker["schema_version"] != 1
+                or marker.get("stop_status") != "stopped_for_review"
+                or marker.get("stop_reason") != "user_requested_pipeline_review"
+                or marker.get("review_authorized") is not True
+                or marker.get("expected_interruption") is not True
+                or marker.get("full_training_completed", False) is not False
+                or marker.get("preserve_resume", True) is not True
+                or type(monitor.get("launcher_returncode")) is not int
+                or monitor["launcher_returncode"] == 0
+                or monitor.get("errors") != []
+                or object_value(monitor.get("completion_audit")).get("passed") is True):
+            return None
+        checkpoint = numeric(marker.get("checkpoint_step"), integer=True)
+        observed = numeric(marker.get("last_observed_training_step"), integer=True)
+        current = numeric(monitor.get("training_step"), integer=True)
+        if (checkpoint is None or checkpoint <= 0 or not total or checkpoint >= total
+                or not interval or checkpoint % interval != 0
+                or current not in {checkpoint, checkpoint + 1}
+                or observed not in {checkpoint, checkpoint + 1}
+                or latest != checkpoint
+                or numeric(monitor.get("latest_checkpoint_step"), integer=True) != checkpoint):
+            return None
+        retained = inventory.get("checkpoint_steps")
+        if not isinstance(retained, list) or checkpoint not in [
+                value for value in retained if numeric(value, integer=True) is not None]:
+            return None
+        stopped = timestamp(marker.get("stopped_at_utc"))
+        started = timestamp(monitor.get("started_at"))
+        if stopped is None or (started is not None and stopped < started):
+            return None
+        identities = []
+        for role in ("trainer", "launcher", "supervisor"):
+            pid = numeric(marker.get(f"{role}_pid"), integer=True)
+            created = numeric(marker.get(f"{role}_created"))
+            if pid is None or pid <= 0 or created is None or created <= 0:
+                return None
+            identities.append(pid)
+            if role != "trainer" or f"{role}_pid" in monitor or f"{role}_created" in monitor:
+                if (numeric(monitor.get(f"{role}_pid"), integer=True) != pid
+                        or numeric(monitor.get(f"{role}_created")) != created):
+                    return None
+        if len(set(identities)) != 3:
+            return None
+        expected = marker.get("run_config_sha256")
+        if not isinstance(expected, str) or re.fullmatch(r"[a-f0-9]{64}", expected) is None:
+            return None
+        if self._config_sha256 != expected:
+            return None
+        return checkpoint
 
     def _event(self, value):
         if not isinstance(value, dict):
@@ -338,6 +411,10 @@ class MetricsStore:
             retained = inventory.get("checkpoint_steps", [])
             retained = sorted({value for value in retained if numeric(value, integer=True) is not None}) if isinstance(retained, list) else []
             interval = numeric(training.get("save_every"), integer=True)
+            resume_checkpoint = self._review_checkpoint(monitor, inventory, total, interval, latest)
+            if resume_checkpoint is not None:
+                state = "stopped_for_review"
+                eta = None
             completed_count = len(self._checkpoints)
             if latest is not None and interval:
                 completed_count = max(completed_count, latest // interval + int(latest % interval != 0))
@@ -360,7 +437,10 @@ class MetricsStore:
             result = {"schema_version": 1,
                       "run": {"step": step, "total_steps": total,
                               "progress_percent": min(100, step / total * 100) if step is not None and total else None,
-                              "state": state, "phase": phase, "elapsed_seconds": elapsed, "eta_seconds": eta,
+                              "state": state, "state_label": STATE_LABELS[state], "phase": phase,
+                              "elapsed_seconds": elapsed, "eta_seconds": eta,
+                              "resume_checkpoint_step": resume_checkpoint,
+                              "final_recorded_snapshot": state == "stopped_for_review",
                               "started_at": started, "heartbeat_at": heartbeat, "heartbeat_age_seconds": heartbeat_age,
                               "stale": state == "unavailable" or (state == "running" and (heartbeat_age is None or heartbeat_age > 120)),
                               "validation_passes_completed": numeric(monitor.get("validation_passes_completed"), integer=True),
