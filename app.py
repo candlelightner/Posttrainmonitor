@@ -446,15 +446,17 @@ def configure(store: MetricsStore, auth_settings: AuthSettings) -> None:
             step, total = number(run.get("step")), number(run.get("total_steps"))
             phase, run_state = run.get("phase"), run.get("state")
             is_validation = phase == "validation" and run_state == "running"
+            stopped_for_review = run_state == "stopped_for_review"
+            resume_checkpoint = number(run.get("resume_checkpoint_step"))
             stale = bool(run.get("stale")) or not meta.get("source_available", False)
             status = "Validating" if is_validation else {"training": "Training", "loading": "Loading", "finalizing": "Finalizing"}.get(phase, "Running")
             if run_state != "running":
-                status = {"completed": "Completed", "failed": "Run stopped", "failed_artifact_audit": "Review needed"}.get(run_state, "Waiting for run")
+                status = {"completed": "Completed", "failed": "Run stopped", "failed_artifact_audit": "Review needed", "stopped_for_review": "Stopped for review"}.get(run_state, "Waiting for run")
             labels["status"].set_text(status)
-            labels["status"].classes(replace="status-pill " + ("status-warning" if stale or run_state in ("failed", "failed_artifact_audit") else "status-validation" if is_validation else "status-running"))
-            labels["freshness"].set_text("Source delayed" if stale else "Source current")
+            labels["status"].classes(replace="status-pill " + ("status-warning" if stale or run_state in ("failed", "failed_artifact_audit", "stopped_for_review") else "status-validation" if is_validation else "status-running"))
+            labels["freshness"].set_text("Final recorded snapshot" if stopped_for_review else "Source delayed" if stale else "Source current")
             labels["synced"].set_text(f"Synced {local_time(meta.get('updated_at'), tz)}")
-            labels["model"].set_text(f"{config.get('model') or 'Model unavailable'} · one full training run")
+            labels["model"].set_text(f"{config.get('model') or 'Model unavailable'} · partial run saved for review" if stopped_for_review else f"{config.get('model') or 'Model unavailable'} · one full training run")
             labels["updates"].set_text(fmt(step))
             labels["updates_detail"].set_text(f"of {fmt(total)} planned updates")
             labels["loss"].set_text(fmt(current.get("loss"), 4))
@@ -465,11 +467,11 @@ def configure(store: MetricsStore, auth_settings: AuthSettings) -> None:
             labels["validation_detail"].set_text(f"{abs(reduction):.1f}% {'below' if reduction >= 0 else 'above'} baseline" if reduction is not None else "First full result pending")
             eta = number(run.get("eta_seconds"))
             labels["remaining"].set_text(duration(eta))
-            labels["remaining_detail"].set_text(f"Estimated finish {local_time((number(meta.get('updated_at')) or 0) + eta, tz, date=True)}" if eta is not None else "Waiting for enough timing data")
+            labels["remaining_detail"].set_text(f"Paused for review · resume checkpoint {fmt(resume_checkpoint)}" if stopped_for_review else f"Estimated finish {local_time((number(meta.get('updated_at')) or 0) + eta, tz, date=True)}" if eta is not None else "Waiting for enough timing data")
             progress = min(1, max(0, step / total)) if step is not None and total else 0
             labels["percent"].set_text(f"{progress * 100:.1f}%")
             labels["progress_bar"].set_value(progress)
-            labels["epoch"].set_text(f"1 of {fmt(config.get('epochs') or 1)}")
+            labels["epoch"].set_text(f"Partial · 1 of {fmt(config.get('epochs') or 1)}" if stopped_for_review else f"1 of {fmt(config.get('epochs') or 1)}")
             train_count, accumulation = number(config.get("training_examples")), number(config.get("accumulation"))
             examples = min(train_count, step * accumulation) if train_count is not None and step is not None and accumulation is not None else None
             labels["examples"].set_text(f"{fmt(examples)} of {fmt(train_count)} training examples processed")
@@ -484,6 +486,8 @@ def configure(store: MetricsStore, auth_settings: AuthSettings) -> None:
             notice = ""
             if not meta.get("source_available", False):
                 notice = "Waiting for the training source. Available history stays visible; this page will retry automatically."
+            elif stopped_for_review:
+                notice = f"Stopped for review. This is a partial epoch; checkpoint {fmt(resume_checkpoint)} is saved for resuming. Metrics and resources show the final recorded snapshot."
             elif stale:
                 notice = f"Progress is delayed. The last source heartbeat was {duration(run.get('heartbeat_age_seconds'))} ago; the displayed values are the last available measurements."
             elif run_state in ("failed", "failed_artifact_audit"):
