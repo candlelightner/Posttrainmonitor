@@ -15,6 +15,8 @@ from urllib.parse import parse_qs, urlsplit
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 
+from legal import OperatorDetails, render_legal
+
 
 def hash_password(password, *, salt=None):
     """Return a salted scrypt hash; plaintext is never persisted or logged."""
@@ -196,6 +198,7 @@ class AuthGate:
         host, public, cookie = connection
         path, method = scope.get("path", "/"), scope.get("method", "GET")
         unrestricted = not websocket and ((path == "/login" and method in {"GET", "POST"})
+                                          or (path == "/legal" and method in {"GET", "HEAD"})
                                           or (path == "/healthz" and method == "GET"))
         authenticated = self.sessions.valid(cookie)
         if not unrestricted and not authenticated:
@@ -231,6 +234,7 @@ def install_auth(app, login_html_path, settings):
     """Install before serving NiceGUI; return session manager for testing only."""
     sessions, limiter = Sessions(settings), LoginLimiter(settings)
     template = Path(login_html_path)
+    operator = OperatorDetails.from_env()
 
     async def login_get(request: Request):
         if request.scope["posttrain.auth"]["authenticated"]:
@@ -275,9 +279,15 @@ def install_auth(app, login_html_path, settings):
     async def health(request: Request):
         return JSONResponse({"ok": True})
 
+    async def legal(request: Request):
+        return HTMLResponse(render_legal(operator, cookie_name=settings.cookie_name,
+                                        session_ttl_seconds=settings.session_ttl_seconds,
+                                        login_window_seconds=settings.login_window_seconds))
+
     app.add_route("/login", login_get, methods=["GET"])
     app.add_route("/login", login_post, methods=["POST"])
     app.add_route("/logout", logout, methods=["POST"])
     app.add_route("/healthz", health, methods=["GET"])
+    app.add_route("/legal", legal, methods=["GET", "HEAD"])
     app.add_middleware(AuthGate, settings=settings, sessions=sessions, limiter=limiter)
     return sessions

@@ -25,6 +25,14 @@ systemctl --user restart posttrain-dashboard.service
 
 Authentication protects the NiceGUI HTTP and websocket paths. Sessions expire after 12 hours and are revoked on logout; restarting the app requires logging in again. Public-host cookies are Secure and HttpOnly. Login attempts are rate-limited and modifying requests require a valid origin. `/healthz` reveals only whether the web service is responding.
 
+## Legal & Privacy
+
+`GET` and `HEAD /legal` are public and linked from the login page and dashboard footer. The notice follows the reference monitor's disclosure structure, adapted to this application's shared-password access, in-memory sessions and rate-limit counters, local aggregate history, rolling resource observations and Cloudflare Tunnel. It does not certify legal compliance.
+
+Configure the operator's name, location and contact email using `POSTTRAIN_OPERATOR_NAME`, `POSTTRAIN_OPERATOR_LOCATION` and `POSTTRAIN_OPERATOR_EMAIL` in the private `.env`. These selected contact details are intentionally displayed on the public notice and HTML-escaped. Personal values do not belong in source code, tests or this README. Missing settings show a configuration placeholder; set verified details before deployment.
+
+The application explicitly disables HTTP access logs. Service, warning/error and tunnel diagnostics can remain in the host journal under host retention settings. Session/rate-limit records are held in memory and pruned during later activity or cleared on restart; persisted resource history rolls off at 10,000 observations rather than after a fixed number of days. Other training aggregates are read locally and their retention is managed outside the dashboard.
+
 ## Cloudflare Tunnel
 
 The official `cloudflared` 2026.10.7 binary is installed locally in `bin/`, with its release SHA-256 verified. Its user service is installed but waits for a private connector token.

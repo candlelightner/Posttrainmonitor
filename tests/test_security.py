@@ -12,7 +12,9 @@ from security import AuthSettings, hash_password, install_auth, verify_password
 
 
 @pytest.fixture
-def secured(tmp_path):
+def secured(tmp_path, monkeypatch):
+    for key in ("POSTTRAIN_OPERATOR_NAME", "POSTTRAIN_OPERATOR_LOCATION", "POSTTRAIN_OPERATOR_EMAIL"):
+        monkeypatch.delenv(key, raising=False)
     template = tmp_path / "login.html"
     template.write_text('<form action="/login" method="post"><input name="password" type="password"></form>')
     app = Starlette()

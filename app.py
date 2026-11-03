@@ -304,6 +304,7 @@ def configure(store: MetricsStore, auth_settings: AuthSettings) -> None:
                                     ui.label(title).classes("eyebrow")
                     with ui.element("footer").classes("page-footer"):
                         ui.label("posttrain").classes("footer-brand")
+                        ui.link("Legal & Privacy", "/legal").classes("text-stone-500 text-xs")
                         label("footer", "Aggregate metrics only · updates every 30 seconds")
 
         def update_charts() -> None:
@@ -571,7 +572,7 @@ def main() -> None:
         host=os.environ.get("POSTTRAIN_HOST", "127.0.0.1"),
         port=int(os.environ.get("POSTTRAIN_PORT", "8766")),
         title="Posttrain · training monitor", favicon=str(STATIC / "favicon.svg"),
-        reload=False, show=False, dark=False,
+        reload=False, show=False, dark=False, access_log=False,
     )
 
 
