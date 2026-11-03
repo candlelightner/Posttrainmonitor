@@ -1,6 +1,9 @@
 """Wholly invented fixtures; counts and metrics do not describe a real run."""
+import hashlib
 import json
 from pathlib import Path
+
+import pytest
 
 from metrics import MetricsStore
 
@@ -248,3 +251,134 @@ def test_resource_units_and_timestamp_mean_monitor_observation_not_acquisition(t
     assert row["timestamp"] == 999
     assert result["meta"]["resource_timestamp_semantics"] == "monitor_heartbeat"
     assert result["meta"]["resource_source_interval_seconds"] == 60
+
+
+def fixture_review_stop(tmp_path):
+    """Invented identities, checkpoint boundary, timestamp and config digest."""
+    root, events = fixture_source(tmp_path)
+    monitor = json.loads((root / "runs/monitor/latest.json").read_text())
+    monitor.update(state="failed", phase="training", training_step=20, latest_checkpoint_step=20,
+                   launcher_returncode=241, errors=[], launcher_pid=502, launcher_created=.12,
+                   supervisor_pid=501, supervisor_created=.11)
+    monitor["resources"]["pipeline_processes"] = []
+    write_json(root, "runs/monitor/latest.json", monitor)
+    marker = {"schema_version": 1, "stop_status": "stopped_for_review",
+              "stop_reason": "user_requested_pipeline_review", "review_authorized": True,
+              "expected_interruption": True, "full_training_completed": False, "preserve_resume": True,
+              "checkpoint_step": 20, "last_observed_training_step": 20,
+              "stopped_at_utc": "1970-01-01T00:16:39.500000+00:00",
+              "run_config_sha256": hashlib.sha256((root / "configs/final-run.json").read_bytes()).hexdigest(),
+              "trainer_pid": 503, "trainer_created": .13, "launcher_pid": 502, "launcher_created": .12,
+              "supervisor_pid": 501, "supervisor_created": .11,
+              "unknown_text": "PRIVATE_STOP_MARKER_SENTINEL"}
+    write_json(root, "runs/intentional-stop-review.json", marker)
+    return root, marker, monitor
+
+
+def test_valid_identity_bound_stop_is_partial_resumable_and_has_no_eta(tmp_path):
+    root, marker, _ = fixture_review_stop(tmp_path)
+    result = MetricsStore(root, clock=lambda: 1000).snapshot()
+    assert result["run"]["state"] == "stopped_for_review"
+    assert result["run"]["state_label"] == "Stopped for review"
+    assert result["run"]["eta_seconds"] is None
+    assert result["run"]["resume_checkpoint_step"] == 20
+    assert result["run"]["final_recorded_snapshot"] is True
+    assert result["run"]["progress_percent"] == 25
+    assert result["run"]["stale"] is False
+    assert result["run"]["completion_audit_passed"] is not True
+    encoded = json.dumps(result, allow_nan=False)
+    assert "PRIVATE" not in encoded and marker["run_config_sha256"] not in encoded
+    assert "launcher_pid" not in encoded and "trainer_created" not in encoded
+
+
+@pytest.mark.parametrize("status", ["requested", "pending", "checkpoint_saved_stop_pending"])
+def test_pending_marker_never_relabels_a_running_or_failed_run(tmp_path, status):
+    root, marker, monitor = fixture_review_stop(tmp_path)
+    marker["stop_status"] = status
+    write_json(root, "runs/intentional-stop-review.json", marker)
+    for source_state in ("running", "failed"):
+        monitor["state"] = source_state
+        write_json(root, "runs/monitor/latest.json", monitor)
+        result = MetricsStore(root, clock=lambda: 1000).snapshot()
+        assert result["run"]["state"] == source_state
+        assert result["run"]["resume_checkpoint_step"] is None
+        assert result["run"]["final_recorded_snapshot"] is False
+
+
+@pytest.mark.parametrize("field,value", [
+    ("review_authorized", 1), ("expected_interruption", False),
+    ("schema_version", True), ("stop_status", {"PRIVATE": "PRIVATE_SENTINEL"}),
+    ("stop_reason", "PRIVATE_SENTINEL"), ("checkpoint_step", True),
+    ("checkpoint_step", -1), ("checkpoint_step", 80), ("checkpoint_step", 19),
+    ("last_observed_training_step", 22), ("run_config_sha256", "b" * 64),
+    ("run_config_sha256", {"PRIVATE": "PRIVATE_SENTINEL"}),
+    ("launcher_pid", 999), ("launcher_created", .99),
+    ("supervisor_pid", 999), ("supervisor_created", float("nan")),
+    ("trainer_pid", "PRIVATE_SENTINEL"), ("trainer_pid", 502),
+    ("full_training_completed", True), ("preserve_resume", False),
+    ("stopped_at_utc", "PRIVATE_SENTINEL"),
+])
+def test_malicious_or_incoherent_stop_markers_remain_failed_and_are_stripped(tmp_path, field, value):
+    root, marker, _ = fixture_review_stop(tmp_path)
+    marker[field] = value
+    write_json(root, "runs/intentional-stop-review.json", marker)
+    result = MetricsStore(root, clock=lambda: 1000).snapshot()
+    assert result["run"]["state"] == "failed"
+    assert result["run"]["resume_checkpoint_step"] is None
+    assert "PRIVATE" not in json.dumps(result, allow_nan=False)
+
+
+@pytest.mark.parametrize("field,value", [("launcher_pid", 802), ("launcher_created", 30.),
+                                         ("supervisor_pid", 801), ("supervisor_created", 31.),
+                                         ("training_step", 40), ("latest_checkpoint_step", 10),
+                                         ("launcher_returncode", 0), ("errors", ["PRIVATE_SENTINEL"]),
+                                         ("completion_audit", {"passed": True})])
+def test_stale_marker_cannot_relabel_a_different_failed_job(tmp_path, field, value):
+    root, _, monitor = fixture_review_stop(tmp_path)
+    monitor[field] = value
+    write_json(root, "runs/monitor/latest.json", monitor)
+    result = MetricsStore(root, clock=lambda: 1000).snapshot()
+    assert result["run"]["state"] == "failed" and result["run"]["resume_checkpoint_step"] is None
+
+
+def test_resumed_running_job_and_forged_monitor_state_do_not_inherit_marker(tmp_path):
+    root, _, monitor = fixture_review_stop(tmp_path)
+    store = MetricsStore(root, clock=lambda: 1000)
+    assert store.snapshot()["run"]["state"] == "stopped_for_review"
+    for source_state, expected in (("running", "running"), ("stopped_for_review", "unavailable")):
+        monitor.update(state=source_state, resumed=True, launcher_pid=802, supervisor_pid=801)
+        write_json(root, "runs/monitor/latest.json", monitor)
+        result = store.snapshot(force=True)
+        assert result["run"]["state"] == expected and result["run"]["resume_checkpoint_step"] is None
+
+
+def test_changed_config_or_checkpoint_index_invalidates_marker(tmp_path):
+    root, _, _ = fixture_review_stop(tmp_path)
+    config = json.loads((root / "configs/final-run.json").read_text())
+    config["training"]["epochs"] = 4
+    write_json(root, "configs/final-run.json", config)
+    assert MetricsStore(root, clock=lambda: 1000).snapshot()["run"]["state"] == "failed"
+    root, _, _ = fixture_review_stop(tmp_path / "another")
+    inventory = json.loads((root / "runs/full/checkpoints.json").read_text())
+    inventory["latest_checkpoint"] = "checkpoint-10"
+    write_json(root, "runs/full/checkpoints.json", inventory)
+    assert MetricsStore(root, clock=lambda: 1000).snapshot()["run"]["state"] == "failed"
+
+
+def test_stop_marker_is_only_an_aggregate_read_and_symlinks_are_not_followed(tmp_path, monkeypatch):
+    root, _, _ = fixture_review_stop(tmp_path)
+    original = Path.open
+
+    def guard(path, *args, **kwargs):
+        relative = path.relative_to(root).as_posix() if path.is_relative_to(root) else ""
+        assert relative in {"configs/final-run.json", "data/manifest.json", "runs/final-preparation.json",
+                            "runs/monitor/latest.json", "runs/full/checkpoints.json",
+                            "runs/intentional-stop-review.json", "runs/monitor/events-20990101T000000Z.jsonl"}
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guard)
+    assert MetricsStore(root, clock=lambda: 1000).snapshot()["run"]["state"] == "stopped_for_review"
+    marker_path = root / "runs/intentional-stop-review.json"
+    marker_path.unlink()
+    marker_path.symlink_to(tmp_path / "private-marker")
+    assert MetricsStore(root, clock=lambda: 1000).snapshot()["run"]["state"] == "failed"
